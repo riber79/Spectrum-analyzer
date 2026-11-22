@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="da"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Spektrogram</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@700;800&family=Red+Hat+Text:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* VOICE: precise, calm lab instrument
+   IDEA: a bench spectrum analyser's scrolling waterfall display
+   PICTURE: the live spectrogram itself, newest sound entering at the right edge, with a dBFS colour bar
+   COLOUR/TYPE: navy #0b1433 ground, blue→cyan→yellow→red scale, yellow accent; Red Hat Display + Red Hat Text
+   LAYOUT: modest title + status, big plot, live readouts, controls grid */
+:root{color-scheme:dark;--bg:#0b1433;--panel:#141f4a;--line:#2a3873;--ink:#e9edff;--mute:#a3aee0;--acc:#f7e463}
+*{box-sizing:border-box;min-width:0}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 "Red Hat Text",system-ui,sans-serif;overflow-x:clip}
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 18px;padding:16px max(4vw,14px) 10px;max-width:1240px}
+h1{font:800 clamp(28px,5vw,40px)/1.05 "Red Hat Display",system-ui,sans-serif;margin:0}
+#status{color:var(--mute);font-size:14px;margin:0}
+#status.err{color:#ffb4a6}
+.fig{position:relative;height:clamp(340px,62vh,760px);margin:0 max(2vw,6px);background:#000;border-radius:12px;overflow:hidden;touch-action:none;max-width:1240px}
+.fig canvas{position:absolute;inset:0;width:100%;height:100%}
+.read{display:flex;flex-wrap:wrap;gap:8px 28px;padding:12px max(4vw,14px) 4px;max-width:1240px}
+.read div{display:flex;flex-direction:column}
+.read span{font-size:13px;color:var(--mute)}
+.read b{font:700 22px/1.2 "Red Hat Display",system-ui,sans-serif;font-variant-numeric:tabular-nums;white-space:nowrap}
+.ctl{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;padding:12px max(4vw,14px) 20px;max-width:1240px}
+.btns{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:10px}
+button{min-height:44px;padding:0 18px;border-radius:22px;border:1px solid var(--line);background:var(--panel);color:var(--ink);font:600 16px "Red Hat Text",system-ui,sans-serif;cursor:pointer}
+button.pri{background:var(--acc);color:#0b1433;border-color:var(--acc)}
+button.on{background:#e8452c;border-color:#e8452c;color:#fff}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:3px solid #4fc1c6;outline-offset:2px}
+label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--mute)}
+select{min-height:44px;font:16px "Red Hat Text",system-ui,sans-serif;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:0 10px}
+input[type=range]{width:100%;accent-color:#4fc1c6;height:44px;margin:0}
+.note{padding:0 max(4vw,14px) 32px;color:var(--mute);font-size:14px;max-width:72ch;margin:0}
+</style></head><body>
+<header><h1>Spektrogram</h1><p id="status">Tryk på “Start mikrofon” eller “Åbn lydfil”.</p></header>
+
+<div class="fig" id="fig"><canvas id="cv"></canvas></div>
+
+<div class="read">
+  <div><span>Topfrekvens</span><b id="pf">—</b></div>
+  <div><span>Niveau</span><b id="pl">—</b></div>
+  <div><span>Tone</span><b id="pn">—</b></div>
+  <div><span>Markør</span><b id="pc">tryk i plottet</b></div>
+</div>
+
+<div class="ctl">
+  <div class="btns">
+    <button id="mic" class="pri">Start mikrofon</button>
+    <button id="open">Åbn lydfil</button>
+    <button id="pause">Pause</button>
+    <button id="clear">Ryd</button>
+    <input id="fin" type="file" accept="audio/*,video/*" hidden>
+  </div>
+  <label>Maks. frekvens
+    <select id="fmax"><option>500</option><option selected>1000</option><option>2000</option><option>5000</option><option>10000</option><option>20000</option></select></label>
+  <label>Frekvensskala
+    <select id="scale"><option value="lin">Lineær</option><option value="log">Logaritmisk</option></select></label>
+  <label>Tidsvindue
+    <select id="win"><option value="10">10 s</option><option value="20">20 s</option><option value="40" selected>40 s</option><option value="80">80 s</option></select></label>
+  <label>FFT-størrelse (opløsning)
+    <select id="fft"><option>2048</option><option>4096</option><option selected>8192</option><option>16384</option></select></label>
+  <label>Gulv: <span id="lov">−96 dB</span>
+    <input id="lo" type="range" min="-130" max="-60" step="1" value="-96"></label>
+  <label>Loft: <span id="hiv">0 dB</span>
+    <input id="hi" type="range" min="-60" max="0" step="1" value="0"></label>
+</div>
+<p class="note">Ny lyd tegnes ind fra højre og ruller mod venstre. Lodret akse er frekvens, farven er styrken i dBFS (0 = digitalt maksimum). Brug en større FFT for skarpere frekvenser, en mindre for hurtigere reaktion. Hvis mikrofonen er spærret i visningen, kan du indlæse en optagelse (fx et Memo fra Filer).</p>
+
+<script>
+{
+const $=id=>document.getElementById(id);
+const cv=$('cv'),g=cv.getContext('2d'),fig=$('fig');
+const M={l:52,r:60,t:12,b:30};
+const S={fmax:1000,log:false,T:40,fft:8192,lo:-96,hi:0};
+const FMIN=20;
+let ac=null,an=null,spec=null,src=null,stream=null,mode=null,paused=false;
+let W=0,H=0,dpr=1,pw=1,ph=1,px=0,py=0,ring=null,rg=null,col=null,head=0,filled=0,acc=0,last=0,lastRead=0;
+let rows=new Int32Array(0),cursorY=null;
+
+// Farveskala: mørkeblå -> blå -> cyan -> grøn -> gul -> orange -> mørkerød
+const stops=[[0,[0,0,110]],[.16,[0,25,225]],[.36,[0,150,255]],[.5,[70,215,205]],[.62,[150,225,95]],[.75,[240,222,60]],[.88,[232,105,35]],[1,[135,10,10]]];
+const LUT=new Uint8Array(768);
+for(let i=0;i<256;i++){const t=i/255;let k=0;while(k<stops.length-2&&t>stops[k+1][0])k++;const a=stops[k],b=stops[k+1],u=(t-a[0])/(b[0]-a[0]);for(let c=0;c<3;c++)LUT[i*3+c]=Math.round(a[1][c]+(b[1][c]-a[1][c])*u);}
+
+const fEdge=e=>{const u=1-e/ph;return S.log?FMIN*Math.pow(S.fmax/FMIN,u):S.fmax*u};
+const fToY=f=>S.log?(1-Math.log(f/FMIN)/Math.log(S.fmax/FMIN))*ph:(1-f/S.fmax)*ph;
+const status=(t,err)=>{const s=$('status');s.textContent=t;s.className=err?'err':''};
+const fmtF=f=>f>=1000?(f/1000).toFixed(f>=10000?1:2)+' kHz':f.toFixed(1)+' Hz';
+
+function calcRows(){
+  if(!ac)return;
+  const bin=ac.sampleRate/S.fft,nb=S.fft/2-1;rows=new Int32Array(ph*2);
+  for(let y=0;y<ph;y++){
+    let lo=Math.floor(fEdge(y+1)/bin),hi=Math.floor(fEdge(y)/bin);
+    lo=Math.min(Math.max(lo,0),nb);hi=Math.min(Math.max(hi,lo),nb);rows[y*2]=lo;rows[y*2+1]=hi;
+  }
+}
+function clearRing(){if(!rg)return;rg.fillStyle='#000';rg.fillRect(0,0,pw,ph);head=0;filled=0;acc=0}
+function size(){
+  const r=fig.getBoundingClientRect();dpr=window.devicePixelRatio||1;
+  W=Math.round(r.width*dpr);H=Math.round(r.height*dpr);cv.width=W;cv.height=H;
+  px=Math.round(M.l*dpr);py=Math.round(M.t*dpr);
+  pw=Math.max(10,W-px-Math.round(M.r*dpr));ph=Math.max(10,H-py-Math.round(M.b*dpr));
+  ring=document.createElement('canvas');ring.width=pw;ring.height=ph;rg=ring.getContext('2d');
+  col=rg.createImageData(1,ph);clearRing();calcRows();draw();
+}
+function writeColumn(){
+  const d=col.data,span=S.hi-S.lo||1;
+  for(let y=0;y<ph;y++){
+    let m=-Infinity;for(let b=rows[y*2],e=rows[y*2+1];b<=e;b++)if(spec[b]>m)m=spec[b];
+    let i=Math.round((m-S.lo)/span*255);i=i<0?0:i>255?255:i;
+    const o=y*4;d[o]=LUT[i*3];d[o+1]=LUT[i*3+1];d[o+2]=LUT[i*3+2];d[o+3]=255;
+  }
+  rg.putImageData(col,head,0);head=(head+1)%pw;if(filled<pw)filled++;
+}
+function niceStep(range,max,list){for(const s of list)if(range/s<=max)return s;return list[list.length-1]}
+function draw(){
+  g.fillStyle='#000';g.fillRect(0,0,W,H);
+  if(ring){
+    if(pw-head>0)g.drawImage(ring,head,0,pw-head,ph,px,py,pw-head,ph);
+    if(head>0)g.drawImage(ring,0,0,head,ph,px+pw-head,py,head,ph);
+  }
+  const fs=11*dpr;g.font=`500 ${fs}px "Red Hat Text",system-ui,sans-serif`;
+  g.lineWidth=Math.max(1,dpr*.75);g.strokeStyle='rgba(255,255,255,.38)';g.fillStyle='#cdd4f5';
+  // frekvensakse
+  g.textAlign='right';g.textBaseline='middle';
+  let ticks=[];
+  if(S.log){for(const f of [20,50,100,200,500,1000,2000,5000,10000,20000])if(f>=FMIN&&f<=S.fmax)ticks.push(f)}
+  else{const st=niceStep(S.fmax,8,[50,100,125,250,500,1000,2000,2500,5000]);for(let f=0;f<=S.fmax+1e-6;f+=st)ticks.push(f)}
+  for(const f of ticks){
+    const y=py+fToY(f);g.beginPath();g.moveTo(px-6*dpr,y);g.lineTo(px+pw,y);g.stroke();
+    g.fillText(f>=1000&&S.fmax>2000?(f/1000)+'k':String(f),px-9*dpr,Math.min(Math.max(y,py+fs/2),py+ph-fs/2));
+  }
+  // tidsakse (sekunder siden)
+  g.textAlign='center';g.textBaseline='top';
+  for(let i=0;i<=4;i++){
+    const x=px+pw*i/4;g.beginPath();g.moveTo(x,py);g.lineTo(x,py+ph+6*dpr);g.stroke();
+    const s=S.T*(4-i)/4,lab=i===4?'nu':'−'+s+' s';
+    g.textAlign=i===0?'left':i===4?'right':'center';g.fillText(lab,x,py+ph+9*dpr);
+  }
+  g.strokeRect(px,py,pw,ph);
+  // farvebar
+  const bx=px+pw+10*dpr,bw=12*dpr;
+  for(let y=0;y<ph;y++){const i=Math.round(255*(1-y/(ph-1)));g.fillStyle=`rgb(${LUT[i*3]},${LUT[i*3+1]},${LUT[i*3+2]})`;g.fillRect(bx,py+y,bw,1.5)}
+  g.fillStyle='#cdd4f5';g.textAlign='left';g.textBaseline='middle';
+  const span=S.hi-S.lo,dst=niceStep(span,8,[6,12,24,48]);
+  for(let v=S.hi;v>=S.lo-1e-6;v-=dst){const y=py+(S.hi-v)/span*ph;g.fillText(String(Math.round(v)),bx+bw+4*dpr,Math.min(Math.max(y,py+fs/2),py+ph-fs/2))}
+  g.save();g.translate(W-4*dpr,py+ph/2);g.rotate(-Math.PI/2);g.textAlign='center';g.textBaseline='bottom';g.fillText('dBFS',0,0);g.restore();
+  g.save();g.translate(12*dpr,py+ph/2);g.rotate(-Math.PI/2);g.textAlign='center';g.textBaseline='middle';g.fillText('Frekvens (Hz)',0,0);g.restore();
+  // markør
+  if(cursorY!=null&&cursorY>=0&&cursorY<=ph){
+    const y=py+cursorY;g.strokeStyle='#f7e463';g.setLineDash([6*dpr,4*dpr]);g.beginPath();g.moveTo(px,y);g.lineTo(px+pw,y);g.stroke();g.setLineDash([]);
+  }
+  if(!src&&filled===0){g.fillStyle='#7f8bc4';g.textAlign='center';g.textBaseline='middle';g.font=`600 ${14*dpr}px "Red Hat Text",system-ui,sans-serif`;g.fillText('Ingen lyd endnu',px+pw/2,py+ph/2)}
+}
+const NAMES=['C','C#','D','D#','E','F','F#','G','G#','A','A#','H'];
+function readout(){
+  const bin=ac.sampleRate/S.fft,a0=Math.max(1,Math.ceil(FMIN/bin)),a1=Math.min(spec.length-2,Math.floor(S.fmax/bin));
+  let bi=a0;for(let i=a0;i<=a1;i++)if(spec[i]>spec[bi])bi=i;
+  const lv=spec[bi];
+  if(!isFinite(lv)||lv<S.lo+6){$('pf').textContent='—';$('pl').textContent=isFinite(lv)?lv.toFixed(0)+' dB':'—';$('pn').textContent='—';return}
+  const A=spec[bi-1],B=spec[bi],C=spec[bi+1],den=A-2*B+C,p=den?.5*(A-C)/den:0,f=(bi+p)*bin;
+  const n=12*Math.log2(f/440)+69,r=Math.round(n),cents=Math.round((n-r)*100);
+  $('pf').textContent=fmtF(f);$('pl').textContent=lv.toFixed(0)+' dB';
+  $('pn').textContent=NAMES[((r%12)+12)%12]+(Math.floor(r/12)-1)+' '+(cents>=0?'+':'−')+Math.abs(cents)+' c';
+}
+function loop(t){
+  requestAnimationFrame(loop);
+  if(an&&src&&!paused){
+    const dt=last?Math.min((t-last)/1000,.25):0;acc+=dt;const cdt=S.T/pw;let n=Math.floor(acc/cdt);
+    if(n>0){acc-=n*cdt;an.getFloatFrequencyData(spec);n=Math.min(n,pw);for(let i=0;i<n;i++)writeColumn();
+      if(t-lastRead>100){readout();lastRead=t}}
+  }
+  last=t;draw();
+}
+function ensureCtx(){
+  if(!ac){ac=new (window.AudioContext||window.webkitAudioContext)();an=ac.createAnalyser();an.smoothingTimeConstant=0;an.fftSize=S.fft;spec=new Float32Array(an.frequencyBinCount);calcRows()}
+  if(ac.state!=='running')ac.resume().catch(()=>{});
+}
+function stopSrc(){
+  if(src){try{if(src.stop)src.stop()}catch(e){}try{src.disconnect()}catch(e){}}
+  if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}
+  src=null;mode=null;$('mic').textContent='Start mikrofon';$('mic').classList.remove('on');
+}
+$('mic').addEventListener('click',async()=>{
+  if(mode==='mic'){stopSrc();status('Mikrofonen er stoppet.');return}
+  ensureCtx();
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){status('Mikrofonen er ikke tilgængelig her. Brug “Åbn lydfil”, eller åbn siden via https.',true);return}
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+    stopSrc();stream=s;src=ac.createMediaStreamSource(s);src.connect(an);mode='mic';
+    if(paused)togglePause();
+    $('mic').textContent='Stop mikrofon';$('mic').classList.add('on');
+    status('Lytter på mikrofonen · samplerate '+ac.sampleRate+' Hz');
+  }catch(e){status('Mikrofonen blev afvist eller er spærret i denne visning. Brug “Åbn lydfil”, eller åbn HTML-filen fra en https-adresse.',true)}
+});
+$('open').addEventListener('click',()=>{ensureCtx();$('fin').click()});
+$('fin').addEventListener('change',async e=>{
+  const f=e.target.files[0];if(!f)return;e.target.value='';
+  status('Indlæser '+f.name+' …');
+  try{
+    const ab=await f.arrayBuffer();
+    const buf=await new Promise((ok,no)=>{const p=ac.decodeAudioData(ab,ok,no);if(p&&p.catch)p.catch(no)});
+    stopSrc();clearRing();
+    const s=ac.createBufferSource();s.buffer=buf;s.connect(an);s.connect(ac.destination);
+    s.onended=()=>{if(src===s){src=null;mode=null;status('Færdig: '+f.name)}};
+    if(paused)togglePause();
+    s.start();src=s;mode='file';
+    status('Afspiller '+f.name+' · '+buf.duration.toFixed(1)+' s · '+ac.sampleRate+' Hz');
+  }catch(err){status('Kunne ikke læse filen som lyd.',true)}
+});
+function togglePause(){
+  paused=!paused;$('pause').textContent=paused?'Fortsæt':'Pause';
+  if(ac&&mode==='file')(paused?ac.suspend():ac.resume()).catch(()=>{});
+  last=0;
+}
+$('pause').addEventListener('click',togglePause);
+$('clear').addEventListener('click',()=>{clearRing();draw()});
+const bind=(id,fn,reset)=>$(id).addEventListener(id==='lo'||id==='hi'?'input':'change',e=>{fn(e.target.value);if(an&&an.fftSize!==S.fft){an.fftSize=S.fft;spec=new Float32Array(an.frequencyBinCount)}calcRows();if(reset)clearRing();draw()});
+bind('fmax',v=>S.fmax=+v,true);
+bind('scale',v=>S.log=v==='log',true);
+bind('win',v=>S.T=+v,true);
+bind('fft',v=>S.fft=+v,true);
+bind('lo',v=>{S.lo=+v;$('lov').textContent=String(v).replace('-','−')+' dB'});
+bind('hi',v=>{S.hi=+v;$('hiv').textContent=String(v).replace('-','−')+' dB'});
+function pointer(e){
+  const r=cv.getBoundingClientRect(),y=(e.clientY-r.top)*dpr-py,x=(e.clientX-r.left)*dpr-px;
+  if(y<0||y>ph||x<0||x>pw){cursorY=null;$('pc').textContent='tryk i plottet';return}
+  cursorY=y;const f=fEdge(y),s=S.T*(1-x/pw);
+  $('pc').textContent=fmtF(Math.max(0,f))+' · −'+s.toFixed(1)+' s';
+}
+fig.addEventListener('pointerdown',pointer);
+fig.addEventListener('pointermove',e=>{if(e.pointerType==='mouse'||e.buttons)pointer(e)});
+const ro=new ResizeObserver(size);ro.observe(fig);
+requestAnimationFrame(loop);
+}
+</script>
+</body></html>
